@@ -17,6 +17,7 @@ import os
 import re
 import socket
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from urllib.parse import urljoin, urlparse
 
@@ -68,6 +69,10 @@ PAGE_HINTS = [
 
 class OpenerError(Exception):
     """Something the user should see (bad URL, unreadable site, model failure)."""
+
+
+class KeyProblem(OpenerError):
+    """The API key is missing, invalid, or out of free quota: a different key would fix it."""
 
 
 # ---------- 1. URL handling ----------
@@ -180,7 +185,12 @@ def find_extra_pages(base_url: str, links: list[str]) -> list[str]:
 
 def read_site(url: str) -> list[Page]:
     headers = {"User-Agent": USER_AGENT, "Accept": "text/html"}
-    with httpx.Client(headers=headers, timeout=FETCH_TIMEOUT, follow_redirects=True) as client:
+    # Connect over IPv4: on networks with broken IPv6, httpx waits ~20s per new connection
+    # before giving up on the IPv6 address (seen on pirsch.io: 20.6s vs 0.6s over IPv4).
+    transport = httpx.HTTPTransport(local_address="0.0.0.0", retries=1)
+    with httpx.Client(
+        headers=headers, timeout=FETCH_TIMEOUT, follow_redirects=True, transport=transport
+    ) as client:
         try:
             final_url, html = fetch_html(client, url)
         except httpx.HTTPError as e:
@@ -188,14 +198,19 @@ def read_site(url: str) -> list[Page]:
         home, links = extract(html, final_url)
         pages = [home]
 
-        for extra in find_extra_pages(final_url, links):
+        def fetch_extra(link: str) -> Page | None:
             try:
-                extra_url, extra_html = fetch_html(client, extra)
+                extra_url, extra_html = fetch_html(client, link)
                 page = extract(extra_html, extra_url)[0]
-                if len(page.text) >= 200:
-                    pages.append(page)
+                return page if len(page.text) >= 200 else None
             except (OpenerError, httpx.HTTPError):
-                pass  # extra pages are a bonus, not required
+                return None  # extra pages are a bonus, not required
+
+        # Fetch the extra pages in parallel: slow sites otherwise add ~5s per page.
+        extras = find_extra_pages(final_url, links)
+        if extras:
+            with ThreadPoolExecutor(max_workers=len(extras)) as pool:
+                pages += [p for p in pool.map(fetch_extra, extras) if p]
 
     if sum(len(p.text) for p in pages) < MIN_USEFUL_CHARS:
         raise OpenerError(
@@ -303,11 +318,13 @@ def _call_gemini(key: str, model: str, prompt: str) -> tuple[Draft, dict]:
         except genai_errors.ClientError as e:
             if e.code == 429:
                 if "per day" in str(e):
-                    raise OpenerError(
+                    raise KeyProblem(
                         "Gemini's free daily request limit for this model is used up. "
                         "Switch to Groq or try again tomorrow."
                     )
-                raise OpenerError("Gemini rate limit hit (free tier). Wait a minute and try again.")
+                raise KeyProblem("Gemini rate limit hit (free tier). Wait a minute and try again.")
+            if e.code in (400, 401, 403) and "key" in str(e).lower():
+                raise KeyProblem("Gemini rejected the API key. Check that it was copied correctly.")
             raise OpenerError(f"Gemini rejected the request: {e.message}")
         except genai_errors.ServerError as e:
             if wait is None:
@@ -341,10 +358,10 @@ def _call_groq(key: str, model: str, prompt: str) -> tuple[Draft, dict]:
             break
         except groq.RateLimitError as e:
             if "per day" in str(e).lower():
-                raise OpenerError("Groq's free daily limit is used up. Switch to Gemini or try again tomorrow.")
-            raise OpenerError("Groq rate limit hit (free tier). Wait a minute and try again.")
+                raise KeyProblem("Groq's free daily limit is used up. Switch to Gemini or try again tomorrow.")
+            raise KeyProblem("Groq rate limit hit (free tier). Wait a minute and try again.")
         except groq.AuthenticationError:
-            raise OpenerError("Groq rejected the API key. Check GROQ_API_KEY.")
+            raise KeyProblem("Groq rejected the API key. Check that it was copied correctly.")
         except (groq.InternalServerError, groq.APIConnectionError) as e:
             if wait is None:
                 raise OpenerError(f"Groq is having trouble right now ({type(e).__name__}). Try again.")
@@ -487,7 +504,7 @@ def draft_opener(
         os.environ.get("GOOGLE_API_KEY") if provider == "gemini" else None
     )
     if not key:
-        raise OpenerError(f"No {provider.title()} API key. Set {key_env} (free at {key_site}).")
+        raise KeyProblem(f"No {provider.title()} API key. Set {key_env} (free at {key_site}).")
 
     url = normalize_url(raw_url)
     pages = read_site(url)
